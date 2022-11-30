@@ -139,37 +139,66 @@ class ScanProcess extends Process:
   static MSG_REQ_RESULT_  ::= 4
   static MSG_RESP_RESULT_ ::= 5
 
-  static START_ ::= 10
-  static START_BLOCK_  ::= 1
-  static START_PERIOD_ ::= 4
+  static REQ_START_ ::= 10
+  static REQ_START_BLOCK_  ::= 1
+  static REQ_START_PERIOD_ ::= 4
 
-  static STATUS_ ::= 13
-  static STATUS_FINISHED_ ::= 1
-  static STATUS_COUNT_    ::= 2
+  static REQ_STATUS_ ::= 12
 
-  static RESP_ ::= 14
-  static RESP_COUNT_ ::= 2
+  static RESP_STATUS_ ::= 13
+  static RESP_STATUS_FINISHED_ ::= 1
+  static RESP_STATUS_COUNT_    ::= 2
 
-  static RESULT_ ::= 15
-  static RESULT_ENTRIES_ ::= 1
-  static RESULT_ENTRIES_SSID_    ::= 1
-  static RESULT_ENTRIES_CHANNEL_ ::= 2
-  static RESULT_ENTRIES_RSSI_    ::= 3
-  static RESULT_ENTRIES_BSSID_   ::= 4
-  static RESULT_ENTRIES_AUTH_    ::= 5
+  static REQ_RESULT_ ::= 14
+  static REQ_RESULT_START_ ::= 1
+  static REQ_RESULT_COUNT_ ::= 2
 
-  ap_list := [{"ssid":"AFAST_IK"}]
-  report_count := 0
+  static RESP_RESULT_ ::= 15
+  static RESP_RESULT_ENTRIES_ ::= 1
+  static RESP_RESULT_ENTRIES_SSID_    ::= 1
+  static RESP_RESULT_ENTRIES_CHANNEL_ ::= 2
+  static RESP_RESULT_ENTRIES_RSSI_    ::= 3
+  static RESP_RESULT_ENTRIES_BSSID_   ::= 4
+  static RESP_RESULT_ENTRIES_AUTH_    ::= 5
+
+  static CHANNEL_NUM_ ::= 14
+  ap_list_ := List
+  report_count_ := 4
+  block_ := true
+  period_ := 120
+
+  msg_offset_ := 0
+
+  constructor :
+
+  comp_ap_by_rssi_ a/Map b/Map -> int:
+    a_rssi := a[wifi.SCAN_AP_RSSI]
+    b_rssi := b[wifi.SCAN_AP_RSSI]
+    if a_rssi < b_rssi:
+      return 1
+    else if a_rssi == b_rssi:
+      return 0
+    else:
+      return -1
+
+  scan_task_:
+    channels := ByteArray CHANNEL_NUM_
+    CHANNEL_NUM_.repeat: channels[it]=it + 1
+    ap_list_ = wifi.scan
+        channels
+        --period_per_channel=period_
+    ap_list_.sort --in_place=true:
+      | a b | comp_ap_by_rssi_ a b
 
   scan_start_ r/protobuf.Reader -> ByteArray:
-    block := 0
-    period := 0
-
     r.read_message:
-      r.read_field START_BLOCK_:
-        block = r.read_primitive protobuf.PROTOBUF_TYPE_INT32
-      r.read_field START_PERIOD_:
-        period = r.read_primitive protobuf.PROTOBUF_TYPE_INT32
+      r.read_field REQ_START_BLOCK_:
+        block_ = r.read_primitive protobuf.PROTOBUF_TYPE_INT32
+      r.read_field REQ_START_PERIOD_:
+        period_ = r.read_primitive protobuf.PROTOBUF_TYPE_INT32
+
+    msg_offset_ = 0
+    scan_task_
 
     resp_msg := {
         MSG_: MSG_RESP_START_
@@ -183,9 +212,9 @@ class ScanProcess extends Process:
 
     resp_msg := {
         MSG_: MSG_RESP_STATUS_,
-        STATUS_: {
-            STATUS_FINISHED_: 1,
-            STATUS_COUNT_: ap_list.size
+        RESP_STATUS_: {
+            RESP_STATUS_FINISHED_: 1,
+            RESP_STATUS_COUNT_: ap_list_.size
         }
     }
     resp := protobuf_map_to_bytes --message=resp_msg
@@ -193,41 +222,48 @@ class ScanProcess extends Process:
   
   scan_result_ r/protobuf.Reader -> ByteArray:
     r.read_message:
-        r.read_field RESP_COUNT_:
-          report_count = r.read_primitive protobuf.PROTOBUF_TYPE_INT32
+        r.read_field REQ_RESULT_COUNT_:
+          report_count_ = r.read_primitive protobuf.PROTOBUF_TYPE_INT32
 
-    ap_info_msg := [
-      {
-        RESULT_ENTRIES_SSID_: "AFAST_IK",
-        RESULT_ENTRIES_CHANNEL_: 6,
-        RESULT_ENTRIES_RSSI_: -22,
-        RESULT_ENTRIES_BSSID_: #[0x8c, 0xab, 0x8e, 0xbb, 0x82, 0x08],
-        RESULT_ENTRIES_AUTH_: 3,
-      }
-    ]
+    ap_info_msg := List
+    if msg_offset_ < ap_list_.size:
+      ap_num := min (ap_list_.size - msg_offset_) report_count_
+      ap_num.repeat:
+        ap_node := ap_list_[msg_offset_ + it]
+        ap_info := {
+          RESP_RESULT_ENTRIES_SSID_: ap_node[wifi.SCAN_AP_SSID],
+          RESP_RESULT_ENTRIES_CHANNEL_: ap_node[wifi.SCAN_AP_CHANNEL],
+          RESP_RESULT_ENTRIES_RSSI_: ap_node[wifi.SCAN_AP_RSSI],
+          RESP_RESULT_ENTRIES_BSSID_: ap_node[wifi.SCAN_AP_BSSID],
+          RESP_RESULT_ENTRIES_AUTH_: ap_node[wifi.SCAN_AP_AUTHMODE],
+        }
+        ap_info_msg.add ap_info
+
+      msg_offset_ += ap_num
+
     resp_msg := {
       MSG_: MSG_RESP_RESULT_,
-      RESULT_: {
-        RESULT_ENTRIES_: ap_info_msg
+      RESP_RESULT_: {
+        RESP_RESULT_ENTRIES_: ap_info_msg
       }
     }
     resp := protobuf_map_to_bytes --message=resp_msg
     return resp
 
   run data/ByteArray -> ByteArray:
-    msg_id := null
-    count := 0
     resp := #[]
     
     r := protobuf.Reader data
     r.read_message:
       r.read_field MSG_:
-        msg_id = r.read_primitive protobuf.PROTOBUF_TYPE_INT32
-        if msg_id == MSG_REQ_STATUS_:
-          resp = scan_status_
-      r.read_field START_:
+        msg_id := r.read_primitive protobuf.PROTOBUF_TYPE_INT32
+      r.read_field REQ_START_:
         resp = scan_start_ r
-      r.read_field RESP_:
+      r.read_field REQ_STATUS_:
+        /* return to skip invalid message from host */
+        resp = scan_status_
+        return resp
+      r.read_field REQ_RESULT_:
         resp = scan_result_ r
 
     return resp
